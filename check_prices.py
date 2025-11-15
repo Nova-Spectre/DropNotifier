@@ -1,85 +1,94 @@
 # check_prices.py
 """
-Price checker — proxy only for Croma.
-Added: explicit wait for Reliance product-price and failure HTML dump for debugging.
+Price tracker optimized for Apify:
+- Uses Apify proxy only for Croma (APIFY_PROXY_* env vars).
+- Uses default no-proxy browser for other sites.
+- Stealth init script applied for Croma contexts.
+- Saves failing HTML to debug_failures/ on extraction failure.
+Environment vars expected:
+  SUPABASE_URL, SUPABASE_KEY, SLACK_WEBHOOK (optional)
+  APIFY_PROXY_PASSWORD (optional)  -> Apify Proxy password (find in Apify Console -> Proxy)
+  APIFY_PROXY_HOSTNAME (optional)  -> default: proxy.apify.com
+  APIFY_PROXY_PORT (optional)      -> default: 8000
+  APIFY_PROXY_GROUPS (optional)    -> e.g. RESIDENTIAL
 """
 import asyncio
 import os
-import traceback
 import re
 import random
-import requests
+import traceback
 import pathlib
-from supabase import create_client
 from datetime import datetime, timezone
+import requests
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, Error as PlaywrightError
+from supabase import create_client
 from dotenv import load_dotenv
-from urllib.parse import urlparse
+from playwright.async_api import async_playwright, Error as PlaywrightError
 
 load_dotenv()
 
+# ---------------------------
+# Config / Env
+# ---------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK")
-PROXY_SERVER = os.getenv("PROXY_SERVER", "").strip() or None
 
-# Path for storing failure HTMLs (only on failures)
+APIFY_PROXY_PASSWORD = os.getenv("APIFY_PROXY_PASSWORD")  # proxy password (Apify)
+APIFY_PROXY_HOSTNAME = os.getenv("APIFY_PROXY_HOSTNAME", "proxy.apify.com")
+APIFY_PROXY_PORT = os.getenv("APIFY_PROXY_PORT", "8000")
+APIFY_PROXY_GROUPS = os.getenv("APIFY_PROXY_GROUPS", "").strip()  # e.g. RESIDENTIAL
+
 DEBUG_DIR = pathlib.Path("debug_failures")
 DEBUG_DIR.mkdir(exist_ok=True)
 
+# Supabase client (requires SUPABASE_URL and SUPABASE_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+# ---------------------------
+# Helpers
+# ---------------------------
 def send_slack(message: str):
+    if not SLACK_WEBHOOK:
+        print("[SLACK] no webhook configured; skipping Slack post.")
+        return
     try:
-        if not SLACK_WEBHOOK:
-            print("[SLACK] no webhook set — message would be:", message)
-            return
         requests.post(SLACK_WEBHOOK, json={"text": message}, timeout=10)
     except Exception as e:
-        print("Slack error:", e)
+        print("Slack send error:", e)
 
 
-class ProxyConnectionError(Exception):
-    pass
+def build_apify_proxy_settings():
+    """
+    Build Playwright proxy dict for Apify proxy or return None if not configured.
+    Playwright expects: {"server": "http://host:port", "username": "...", "password": "..."}
+    Username encodes groups as: groups-RESIDENTIAL (if APIFY_PROXY_GROUPS set)
+    """
+    if not APIFY_PROXY_PASSWORD:
+        return None
+    username = f"groups-{APIFY_PROXY_GROUPS}" if APIFY_PROXY_GROUPS else "auto"
+    server = f"http://{APIFY_PROXY_HOSTNAME}:{APIFY_PROXY_PORT}"
+    return {"server": server, "username": username, "password": APIFY_PROXY_PASSWORD}
 
 
 def sanitize_filename(s: str) -> str:
-    # very small sanitizer for filenames
-    return re.sub(r"[^0-9A-Za-z-_\.]", "_", s)[:200]
+    return re.sub(r"[^0-9A-Za-z-_.]", "_", s)[:240]
 
 
-async def create_stealth_context(browser, site: str = None):
-    real_ua = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.6261.95 Safari/537.36"
-    )
-    opts = dict(
-        user_agent=real_ua,
-        viewport={"width": 1280, "height": 800},
-        locale="en-US",
-        timezone_id="Asia/Kolkata",
-        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-    )
-
-    if site == "croma":
-        context = await browser.new_context(
-            **opts,
-            java_script_enabled=True,
-            color_scheme="light",
-            device_scale_factor=1,
-            is_mobile=False,
-            has_touch=False,
-            geolocation={"longitude": 72.8777, "latitude": 19.0760},
-            permissions=["geolocation"],
-        )
-        await context.add_init_script(
-            """
+# ---------------------------
+# Extraction logic
+# ---------------------------
+async def add_stealth_shims(context):
+    """
+    Adds a small stealth script to the context to reduce obvious automation flags.
+    (We add only minimal, safe shims.)
+    """
+    await context.add_init_script(
+        """
 try {
   Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
-  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'], configurable: true });
   Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3], configurable: true });
   try {
     const originalQuery = navigator.permissions.query.bind(navigator.permissions);
@@ -95,19 +104,67 @@ try {
   };
 } catch(e){}
 """
+    )
+
+
+async def create_context_for(browser, site: str):
+    """
+    Create a Playwright context configured for the given site.
+    For Croma, we also add stealth shims and some extra permissions.
+    """
+    real_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.6261.95 Safari/537.36"
+    )
+    base_opts = dict(
+        user_agent=real_ua,
+        viewport={"width": 1280, "height": 800},
+        locale="en-US",
+        timezone_id="Asia/Kolkata",
+        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+    )
+
+    if site == "croma":
+        ctx = await browser.new_context(
+            **base_opts,
+            java_script_enabled=True,
+            color_scheme="light",
+            device_scale_factor=1,
+            is_mobile=False,
+            has_touch=False,
+            geolocation={"longitude": 72.8777, "latitude": 19.0760},
+            permissions=["geolocation"],
         )
-        return context
+        await add_stealth_shims(ctx)
+        return ctx
 
-    return await browser.new_context(**opts)
+    return await browser.new_context(**base_opts)
 
 
-async def extract_price_from_html(site: str, html: str, page=None):
+def normalize_price_string(price_raw: str):
+    if not price_raw:
+        return None
+    s = str(price_raw)
+    s = s.replace("₹", "").replace("INR", "").replace("MRP", "")
+    s = re.sub(r"[^\d.,]", "", s)
+    if s.count(",") and s.count(".") == 0:
+        s = s.replace(",", "")
+    s = s.replace(",", "")
+    return s.strip() if s else None
+
+
+async def extract_price(site: str, html: str, page=None):
+    """
+    Return raw price string (may contain digits/comma/dot) or None.
+    For croma we attempt page.evaluate checks first (if page provided), else HTML parse.
+    """
     soup = BeautifulSoup(html, "html.parser")
     price_raw = None
 
     if site == "flipkart":
-        elem = soup.select_one(".Nx9bqj.CxhGGd")
-        price_raw = elem.text if elem else None
+        el = soup.select_one(".Nx9bqj.CxhGGd")
+        price_raw = el.text if el else None
 
     elif site == "amazon":
         whole = soup.select_one("span.a-price-whole")
@@ -118,12 +175,12 @@ async def extract_price_from_html(site: str, html: str, page=None):
             price_raw = f"{whole_digits}.{frac_digits}"
 
     elif site == "reliance":
-        # primary selector
-        elem = soup.select_one("div.product-price")
-        if elem:
-            price_raw = elem.get_text(strip=True).replace("MRP", "")
+        el = soup.select_one("div.product-price")
+        if el:
+            price_raw = el.get_text(strip=True).replace("MRP", "")
 
     elif site == "croma":
+        # Prefer reading from page JS objects if possible
         if page:
             try:
                 found = await page.evaluate(
@@ -172,10 +229,11 @@ async def extract_price_from_html(site: str, html: str, page=None):
             except Exception:
                 price_raw = price_raw
 
+        # fallback: regex/script/DOM in HTML
         if not price_raw:
             regexes = [
-                r'"sellingPrice"\s*:\s*{\s*"value"\s*:\s*"(?P<v>[\d,]+)"',
-                r'"pdpPriceData"\s*:\s*{[^}]*"sellingPrice"\s*:\s*{[^}]*"value"\s*:\s*"(?P<v>[\d,]+)"',
+                r'"sellingPrice"\s*:\s*{\s*"value"\s*:\s*"?(?P<v>[\d,]+)"?',
+                r'"pdpPriceData"\s*:\s*{[^}]*"sellingPrice"\s*:\s*{[^}]*"value"\s*:\s*"?(?P<v>[\d,]+)"?',
                 r'"value"\s*:\s*"(?P<v>[\d,]+)"\s*,\s*"currency"',
                 r'"mrp"\s*:\s*{\s*"value"\s*:\s*"(?P<v>[\d,]+)"',
             ]
@@ -199,39 +257,31 @@ async def extract_price_from_html(site: str, html: str, page=None):
                         break
 
         if not price_raw:
-            elem = (
+            el = (
                 soup.select_one("#pdp-product-price")
                 or soup.select_one("div.product-price")
                 or soup.select_one("span.pdp-selling-price")
                 or soup.select_one("span.price")
                 or soup.select_one("span.offer-price")
             )
-            if elem:
-                price_raw = elem.get("value") or elem.get_text(strip=True)
+            if el:
+                price_raw = el.get("value") or el.get_text(strip=True)
 
     return price_raw
 
 
-def normalize_price_string(price_raw: str):
-    if not price_raw:
-        return None
-    s = str(price_raw).strip()
-    s = s.replace("₹", "").replace("INR", "").replace("MRP", "").strip()
-    s = re.sub(r"[^\d.,]", "", s)
-    if s.count(",") and s.count(".") == 0:
-        s = s.replace(",", "")
-    s = s.replace(",", "")
-    return s if s else None
-
-
-async def get_price_for_item(browser, site, url):
+# ---------------------------
+# Page price extraction flow
+# ---------------------------
+async def get_price_with_context(browser, site: str, url: str):
     attempt = 0
     last_exc = None
     while attempt < 2:
         attempt += 1
-        context = await create_stealth_context(browser, site=site)
+        context = await create_context_for(browser, site)
         page = await context.new_page()
         try:
+            # tiny human-like delay
             await asyncio.sleep(random.uniform(0.2, 0.6))
             try:
                 await page.mouse.move(random.randint(10, 60), random.randint(10, 60), steps=3)
@@ -240,45 +290,44 @@ async def get_price_for_item(browser, site, url):
 
             if site == "croma":
                 await page.goto(url, timeout=90000, wait_until="networkidle")
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(1200)
             else:
                 await page.goto(url, timeout=60000, wait_until="domcontentloaded")
 
-            # NEW: explicit wait for Reliance price node
+            # specific wait for reliance price
             if site == "reliance":
                 try:
                     await page.wait_for_selector("div.product-price", timeout=15000)
                 except Exception:
-                    # will continue; extraction will fail and cause debug dump
                     pass
 
             html = await page.content()
-            price_raw = await extract_price_from_html(site, html, page=page)
+            price_raw = await extract_price(site, html, page=page)
 
             if not price_raw:
+                # wait a tiny bit and retry the DOM
                 await page.wait_for_timeout(1000)
                 html2 = await page.content()
-                price_raw = await extract_price_from_html(site, html2, page=page)
+                price_raw = await extract_price(site, html2, page=page)
 
             if not price_raw:
-                # save failing HTML for debugging (only on failure)
+                # save HTML only on failure for debugging
                 try:
-                    parsed = urlparse(url)
-                    fname = sanitize_filename(f"{site}_{parsed.netloc}_{parsed.path}_{parsed.query}")
-                    file_path = DEBUG_DIR / f"{fname}.html"
+                    parsed = url.replace("://", "_").replace("/", "_")
+                    fname = sanitize_filename(f"{site}_{parsed}") + ".html"
+                    file_path = DEBUG_DIR / fname
                     file_path.write_text(html, encoding="utf-8")
-                    print(f"[DEBUG] Saved failing HTML: {file_path}")
-                    # also print short snippet to console
+                    print(f"[DEBUG] saved failing HTML to {file_path}")
                     snippet = (html[:800] + "...") if len(html) > 800 else html
-                    print("[DEBUG] HTML snippet (first 800 chars):\n", snippet)
+                    print("[DEBUG] HTML snippet:", snippet)
                 except Exception as dump_e:
-                    print("[DEBUG] Failed to write debug HTML:", dump_e)
+                    print("[DEBUG] failed writing debug HTML:", dump_e)
 
                 raise Exception("Price not found (no matching pattern / selector).")
 
             price_str = normalize_price_string(price_raw)
             if not price_str:
-                raise Exception("Price normalization failed (empty after cleanup)")
+                raise Exception("Price normalization failed.")
 
             await page.close()
             await context.close()
@@ -286,6 +335,7 @@ async def get_price_for_item(browser, site, url):
 
         except PlaywrightError as e:
             msg = str(e)
+            # detect proxy/network problems
             if "ERR_PROXY_CONNECTION_FAILED" in msg or "ERR_NETWORK_CHANGED" in msg or "ERR_TUNNEL_CONNECTION_FAILED" in msg:
                 try:
                     await page.close()
@@ -295,7 +345,7 @@ async def get_price_for_item(browser, site, url):
                     await context.close()
                 except Exception:
                     pass
-                raise ProxyConnectionError(msg)
+                raise e  # propagate proxy/network errors up
             last_exc = e
             print(f"[WARN] attempt {attempt} failed for {url}: {e}")
             try:
@@ -323,10 +373,13 @@ async def get_price_for_item(browser, site, url):
             await asyncio.sleep(0.7 * attempt)
             continue
 
-    print(f"[ERROR] get_price_for_item failed for {url}: {last_exc}")
+    print(f"[ERROR] get_price_with_context failed for {url}: {last_exc}")
     return None
 
 
+# ---------------------------
+# Main run flow
+# ---------------------------
 async def run_price_check():
     print("Fetching items from Supabase...")
     resp = supabase.table("tracked_items").select("*").eq("active", True).execute()
@@ -348,27 +401,30 @@ async def run_price_check():
         "--disable-infobars",
     ]
 
-    async with async_playwright() as p:
-        async def _launch_browser(use_proxy: bool):
-            launch_kwargs = {"headless": True, "args": launch_args}
-            if use_proxy and PROXY_SERVER:
-                launch_kwargs["proxy"] = {"server": PROXY_SERVER}
-            return await p.chromium.launch(**launch_kwargs)
+    # apify proxy config (only used for Croma)
+    apify_proxy = build_apify_proxy_settings()
 
-        # always launch default browser (no proxy)
+    async with async_playwright() as p:
+        # helper to start browsers: proxy_browser (if apify_proxy set) and default_browser
+        async def _launch_browser(use_proxy: bool):
+            kwargs = {"headless": True, "args": launch_args}
+            if use_proxy and apify_proxy:
+                kwargs["proxy"] = apify_proxy
+            return await p.chromium.launch(**kwargs)
+
+        # default browser (no proxy) used for non-Croma and fallback
         try:
             browser_default = await _launch_browser(False)
         except Exception as e:
-            print("[ERROR] Could not launch default browser:", e)
+            print("[ERROR] could not launch default browser:", e)
             return
 
-        # launch proxy browser only if PROXY_SERVER is provided
         browser_proxy = None
-        if PROXY_SERVER:
+        if apify_proxy:
             try:
                 browser_proxy = await _launch_browser(True)
             except Exception as e:
-                print("[WARN] Could not launch proxy browser (will use default for all):", e)
+                print("[WARN] could not launch proxy browser; continuing with default only:", e)
                 browser_proxy = None
 
         try:
@@ -380,14 +436,17 @@ async def run_price_check():
                 print(f"Checking {site.upper() if site else site} → {url}")
 
                 try:
+                    price = None
+                    # If site is croma, try proxy browser first if available
                     if site == "croma" and browser_proxy:
                         try:
-                            price = await get_price_for_item(browser_proxy, site, url)
-                        except ProxyConnectionError as pe:
+                            price = await get_price_with_context(browser_proxy, site, url)
+                        except PlaywrightError as pe:
+                            # Proxy-level error; retry once with default no-proxy browser
                             print("[WARN] proxy connection error for Croma. Retrying without proxy:", pe)
-                            price = await get_price_for_item(browser_default, site, url)
+                            price = await get_price_with_context(browser_default, site, url)
                     else:
-                        price = await get_price_for_item(browser_default, site, url)
+                        price = await get_price_with_context(browser_default, site, url)
 
                     if price is None:
                         msg = f"❗ ERROR: Could not extract price.\nSite: {site}\nURL: {url}"
@@ -399,6 +458,7 @@ async def run_price_check():
                         }).execute()
                         continue
 
+                    # update tracked_items and history
                     supabase.table("tracked_items").update({
                         "last_price": price,
                         "last_checked_at": datetime.now(timezone.utc).isoformat()
