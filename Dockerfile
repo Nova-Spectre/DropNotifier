@@ -1,4 +1,4 @@
-# Dockerfile
+# Dockerfile (minimal fix)
 FROM python:3.11-slim
 
 # Install system dependencies required by Playwright (browsers)
@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libpangocairo-1.0-0 \
     libgtk-3-0 \
-    libgdk-pixbuf2.0-0 \
+    libgdk-pixbuf-xlib-2.0-0 \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
